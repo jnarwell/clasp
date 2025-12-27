@@ -1,0 +1,28 @@
+"""
+Configuration for clasp - Claude self-knowledge infrastructure.
+
+Copy this file to config.py and fill in your API key.
+"""
+
+import os
+
+# Your Anthropic API key
+# Get one at https://console.anthropic.com/
+ANTHROPIC_API_KEY = os.environ.get(
+    "CLASP_API_KEY",
+    "your-api-key-here"
+)
+
+# Model identifiers
+MODELS = {
+    "opus": "claude-opus-4-20250514",
+    "sonnet": "claude-sonnet-4-20250514",
+    "haiku": "claude-3-5-haiku-20241022",
+}
+
+# Defaults
+DEFAULT_MODEL_A = "sonnet"
+DEFAULT_MODEL_B = "sonnet"
+DEFAULT_MAX_TURNS = 20
+DEFAULT_OUTPUT_DIR = "logs"
+MAX_TOKENS = 4096
