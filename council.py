@@ -114,7 +114,9 @@ def run_council(
     max_turns: int,
     output_dir: str,
     verbose: bool = True,
-    experiment_tag: str | None = None
+    experiment_tag: str | None = None,
+    moderator: dict | None = None,  # {model, role_file, frequency}
+    allow_early_closure: bool = False
 ) -> Path:
     """
     Run a multi-Claude conversation.
@@ -122,6 +124,8 @@ def run_council(
     participants: List of dicts with 'name', 'model', and optional 'role_file'
     shared_context: Context all participants share
     max_turns: Total turns across all participants
+    moderator: Optional moderator config {model, role_file, frequency (every N turns)}
+    allow_early_closure: If True and moderator present, can end before max_turns
     """
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -133,13 +137,30 @@ def run_council(
     # Build participant names list
     participant_names = [p['name'] for p in participants]
 
+    # Setup moderator if provided
+    mod_config = None
+    if moderator:
+        mod_config = {
+            'name': 'Moderator',
+            'model': moderator.get('model', 'opus'),
+            'model_id': get_model_id(moderator.get('model', 'opus')),
+            'role_context': load_role_context(moderator.get('role_file', 'roles/moderator.md')),
+            'frequency': moderator.get('frequency', 3),  # Every N participant rounds
+        }
+        mod_config['system_prompt'] = build_system_prompt(
+            shared_context=shared_context,
+            role_context=mod_config['role_context'],
+            participant_id='Moderator',
+            all_participants=participant_names + ['Moderator']
+        )
+
     # Build system prompts for each participant
     for p in participants:
         p['system_prompt'] = build_system_prompt(
             shared_context=shared_context,
             role_context=p['role_context'],
             participant_id=p['name'],
-            all_participants=participant_names
+            all_participants=participant_names + (['Moderator'] if mod_config else [])
         )
 
     # Create session directory
@@ -246,6 +267,66 @@ def run_council(
             if verbose:
                 preview = response_text[:500] + "..." if len(response_text) > 500 else response_text
                 print(preview)
+
+            # Check if moderator should speak (after every N participant rounds)
+            if mod_config and (turn + 1) % (len(participants) * mod_config['frequency']) == 0:
+                if verbose:
+                    print(f"\n--- Moderator Check-in ---\n")
+
+                dialogue_so_far = "\n\n".join([
+                    f"**{msg['speaker']}:** {msg['content']}"
+                    for msg in conversation_history
+                ])
+
+                mod_prompt = f"""The conversation so far:
+
+{dialogue_so_far}
+
+As Moderator, provide your check-in:
+1. Note what has been AGREED
+2. Note what remains CONTESTED
+3. Note any UNEXAMINED questions
+4. Assess whether the conversation has reached architectural integrity (all major questions addressed, positions stabilized)
+
+If you sense completion, offer: "The architecture appears to have reached integrity. Voices may accept closure or request continuation on specific unresolved points."
+
+Keep your intervention brief - this is their conversation, not yours."""
+
+                mod_response = client.messages.create(
+                    model=mod_config['model_id'],
+                    max_tokens=config.MAX_TOKENS,
+                    system=mod_config['system_prompt'],
+                    messages=[{"role": "user", "content": mod_prompt}]
+                )
+
+                mod_text = mod_response.content[0].text
+                conversation_history.append({
+                    "speaker": "Moderator",
+                    "content": mod_text
+                })
+
+                full_log.append({
+                    "turn": f"mod-{turn + 1}",
+                    "speaker": "Moderator",
+                    "model": mod_config['model_id'],
+                    "response": mod_text,
+                    "stop_reason": mod_response.stop_reason,
+                    "usage": {
+                        "input_tokens": mod_response.usage.input_tokens,
+                        "output_tokens": mod_response.usage.output_tokens
+                    }
+                })
+
+                readable += f"## Moderator\n\n{mod_text}\n\n"
+
+                if verbose:
+                    preview = mod_text[:500] + "..." if len(mod_text) > 500 else mod_text
+                    print(preview)
+
+                # Check for early closure signal
+                if allow_early_closure and "reached integrity" in mod_text.lower():
+                    metadata["ended_reason"] = "moderator_closure"
+                    break
 
         except anthropic.APIError as e:
             print(f"\nAPI Error: {e}")
@@ -355,6 +436,25 @@ Participant format: "Name:model[:role_file]"
         help="Experiment tag for this conversation"
     )
 
+    parser.add_argument(
+        "--moderator",
+        action="store_true",
+        help="Include a moderator that tracks convergence and offers closure"
+    )
+
+    parser.add_argument(
+        "--mod-frequency",
+        type=int,
+        default=2,
+        help="Moderator speaks every N rounds (default: 2)"
+    )
+
+    parser.add_argument(
+        "--allow-early-closure",
+        action="store_true",
+        help="Allow moderator to end conversation early when integrity is reached"
+    )
+
     args = parser.parse_args()
 
     # Parse participants
@@ -379,6 +479,15 @@ Participant format: "Name:model[:role_file]"
     # Load shared context
     shared_context = load_shared_context(args.context)
 
+    # Setup moderator if requested
+    moderator_config = None
+    if args.moderator:
+        moderator_config = {
+            'model': 'opus',
+            'role_file': 'roles/moderator.md',
+            'frequency': args.mod_frequency
+        }
+
     # Run the council
     session_dir = run_council(
         participants=participants,
@@ -386,7 +495,9 @@ Participant format: "Name:model[:role_file]"
         max_turns=args.max_turns,
         output_dir=args.output_dir,
         verbose=not args.quiet,
-        experiment_tag=args.tag
+        experiment_tag=args.tag,
+        moderator=moderator_config,
+        allow_early_closure=args.allow_early_closure
     )
 
     print(f"Session saved to: {session_dir}")
